@@ -1,12 +1,14 @@
 package com.example.projeto2_2026_1
 
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.util.Log
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.example.projeto2_2026_1.databinding.ActivityMonitoramentoBinding
@@ -19,21 +21,19 @@ class MonitoramentoActivity : AppCompatActivity() {
     private var servico: MonitoramentoService? = null
     private var servicoVinculado = false
 
-    // Vinculação com o serviço para receber atualizações em tempo real
     private val conexaoServico = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            Log.d(TAG, "onServiceConnected: vínculo estabelecido com sucesso")
             val b = binder as MonitoramentoService.MonitoramentoBinder
             servico = b.getService()
             servicoVinculado = true
 
-            // Atualiza a UI com o nível de movimento em tempo real
             servico?.onNivelAtualizado = { movimento ->
                 runOnUiThread {
                     binding.tvNivelAtual.text = "Nível atual: ${"%.2f".format(movimento)}"
                 }
             }
 
-            // Atualiza a UI quando dados são enviados com sucesso ao Firestore
             servico?.onDadosEnviados = { nivel, grupo ->
                 runOnUiThread {
                     binding.tvUltimoEnvio.text = "Último envio: ${"%.2f".format(nivel)} ($grupo)"
@@ -42,6 +42,7 @@ class MonitoramentoActivity : AppCompatActivity() {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            Log.d(TAG, "onServiceDisconnected: vínculo perdido")
             servico = null
             servicoVinculado = false
         }
@@ -52,12 +53,13 @@ class MonitoramentoActivity : AppCompatActivity() {
         binding = ActivityMonitoramentoBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Reflete o estado atual do serviço ao abrir a tela
+        Log.d(TAG, "onCreate: isRunning=${MonitoramentoService.isRunning}")
         if (MonitoramentoService.isRunning) {
             atualizarUiAtivo()
         }
 
         binding.btnIniciar.setOnClickListener {
+            Log.d(TAG, "btnIniciar clicado: isRunning=${MonitoramentoService.isRunning}")
             if (MonitoramentoService.isRunning) {
                 pararMonitoramento()
             } else {
@@ -70,31 +72,53 @@ class MonitoramentoActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Vincula ao serviço se ele já estiver rodando
+        Log.d(TAG, "onStart: isRunning=${MonitoramentoService.isRunning} servicoVinculado=$servicoVinculado")
         if (MonitoramentoService.isRunning) {
             val intent = Intent(this, MonitoramentoService::class.java)
-            bindService(intent, conexaoServico, 0)
+            // BIND_AUTO_CREATE garante o vínculo mesmo se o serviço ainda estiver sendo criado
+            val ok = bindService(intent, conexaoServico, Context.BIND_AUTO_CREATE)
+            Log.d(TAG, "onStart: bindService retornou ok=$ok")
         }
     }
 
     override fun onStop() {
         super.onStop()
-        // Desvincula ao sair da tela (o serviço continua rodando em segundo plano)
+        Log.d(TAG, "onStop: servicoVinculado=$servicoVinculado")
         if (servicoVinculado) {
             servico?.onNivelAtualizado = null
             servico?.onDadosEnviados = null
             unbindService(conexaoServico)
             servicoVinculado = false
             servico = null
+            Log.d(TAG, "onStop: unbindService chamado")
         }
     }
 
-    // Solicita permissão de notificação no Android 13+ antes de iniciar o serviço
     private fun verificarPermissaoEIniciar() {
+        // Passo 1: ACTIVITY_RECOGNITION — obrigatória para FGS tipo "health" no Android 10+ (API 29+)
+        // Sem ela o sistema lança SecurityException ao chamar startForegroundService
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (checkSelfPermission(android.Manifest.permission.ACTIVITY_RECOGNITION)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                Log.d(TAG, "verificarPermissao: solicitando ACTIVITY_RECOGNITION")
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.ACTIVITY_RECOGNITION),
+                    CODIGO_PERMISSAO_ATIVIDADE
+                )
+                return
+            }
+        }
+        // Passo 2: POST_NOTIFICATIONS — para a notificação persistente no Android 13+ (API 33+)
+        verificarPermissaoNotificacaoEIniciar()
+    }
+
+    private fun verificarPermissaoNotificacaoEIniciar() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
             ) {
+                Log.d(TAG, "verificarPermissao: solicitando POST_NOTIFICATIONS")
                 requestPermissions(
                     arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
                     CODIGO_PERMISSAO_NOTIFICACAO
@@ -111,15 +135,36 @@ class MonitoramentoActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == CODIGO_PERMISSAO_NOTIFICACAO) {
-            // Inicia mesmo sem a permissão (serviço roda, notificação pode não aparecer)
-            iniciarMonitoramento()
+        when (requestCode) {
+            CODIGO_PERMISSAO_ATIVIDADE -> {
+                val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+                Log.d(TAG, "onRequestPermissionsResult: ACTIVITY_RECOGNITION granted=$granted")
+                if (granted) {
+                    // Permissão concedida — avança para verificar POST_NOTIFICATIONS
+                    verificarPermissaoNotificacaoEIniciar()
+                } else {
+                    // Sem essa permissão o serviço não pode iniciar no Android 14+
+                    Log.e(TAG, "ACTIVITY_RECOGNITION negada — monitoramento bloqueado")
+                    Toast.makeText(
+                        this,
+                        "Permissão de reconhecimento de atividade necessária para o monitoramento.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            CODIGO_PERMISSAO_NOTIFICACAO -> {
+                val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+                Log.d(TAG, "onRequestPermissionsResult: POST_NOTIFICATIONS granted=$granted")
+                // Inicia mesmo sem a permissão — serviço roda, notificação pode não aparecer
+                iniciarMonitoramento()
+            }
         }
     }
 
     private fun iniciarMonitoramento() {
-        // Garante que há uma sessão ativa antes de iniciar o serviço
-        if (FirebaseAuth.getInstance().currentUser == null) {
+        val usuario = FirebaseAuth.getInstance().currentUser
+        Log.d(TAG, "iniciarMonitoramento: currentUser=${usuario?.uid ?: "NULL"}")
+        if (usuario == null) {
             Toast.makeText(this, "Sessão expirada. Faça login novamente.", Toast.LENGTH_LONG).show()
             startActivity(Intent(this, LoginActivity::class.java))
             finish()
@@ -128,16 +173,18 @@ class MonitoramentoActivity : AppCompatActivity() {
 
         val intent = Intent(this, MonitoramentoService::class.java)
         startForegroundService(intent)
-        bindService(intent, conexaoServico, 0)
+        Log.d(TAG, "iniciarMonitoramento: startForegroundService chamado")
+
+        // BIND_AUTO_CREATE: garante o vínculo mesmo que o serviço ainda não tenha sido criado
+        val ok = bindService(intent, conexaoServico, Context.BIND_AUTO_CREATE)
+        Log.d(TAG, "iniciarMonitoramento: bindService ok=$ok")
+
         atualizarUiAtivo()
-        Toast.makeText(
-            this,
-            "Monitoramento iniciado! Pode fechar o app.",
-            Toast.LENGTH_LONG
-        ).show()
+        Toast.makeText(this, "Monitoramento iniciado! Pode fechar o app.", Toast.LENGTH_LONG).show()
     }
 
     private fun pararMonitoramento() {
+        Log.d(TAG, "pararMonitoramento: servicoVinculado=$servicoVinculado")
         if (servicoVinculado) {
             servico?.onNivelAtualizado = null
             servico?.onDadosEnviados = null
@@ -163,6 +210,8 @@ class MonitoramentoActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val TAG = "MONITOR_ACT"
+        private const val CODIGO_PERMISSAO_ATIVIDADE = 1002
         private const val CODIGO_PERMISSAO_NOTIFICACAO = 1001
     }
 }

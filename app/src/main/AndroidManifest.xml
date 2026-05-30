@@ -11,6 +11,9 @@
     <!-- Tipo "health": coleta de dados de sensor para atividade física (Android 14+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH" />
 
+    <!-- Permissão secundária obrigatória para FGS tipo "health" no Android 10+ (API 29+) -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+
     <!-- Notificação persistente do monitoramento (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

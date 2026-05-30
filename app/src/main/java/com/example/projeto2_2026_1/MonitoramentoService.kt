@@ -14,6 +14,7 @@ import android.os.Binder
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
@@ -25,14 +26,12 @@ import kotlin.math.sqrt
 
 class MonitoramentoService : Service(), SensorEventListener {
 
-    // Binder para a Activity se vincular e receber callbacks em tempo real
     inner class MonitoramentoBinder : Binder() {
         fun getService(): MonitoramentoService = this@MonitoramentoService
     }
 
     private val binder = MonitoramentoBinder()
 
-    // Callbacks opcionais — preenchidos pela Activity quando vinculada
     var onNivelAtualizado: ((Double) -> Unit)? = null
     var onDadosEnviados: ((Double, String) -> Unit)? = null
 
@@ -42,7 +41,6 @@ class MonitoramentoService : Service(), SensorEventListener {
     private val db = FirebaseFirestore.getInstance()
     private val auth = FirebaseAuth.getInstance()
 
-    // Acumuladores para a média a cada 5 segundos
     private var somaMovimento = 0.0
     private var totalLeituras = 0
 
@@ -51,21 +49,25 @@ class MonitoramentoService : Service(), SensorEventListener {
 
     private val tarefaEnvio = object : Runnable {
         override fun run() {
+            Log.d(TAG, "tarefaEnvio: totalLeituras=$totalLeituras somaMovimento=$somaMovimento")
             if (totalLeituras > 0) {
                 val media = somaMovimento / totalLeituras
+                Log.d(TAG, "tarefaEnvio: enviando média=$media")
                 enviarDadosFirestore(media)
                 somaMovimento = 0.0
                 totalLeituras = 0
+            } else {
+                Log.d(TAG, "tarefaEnvio: sem leituras acumuladas — sensor está chegando?")
             }
             handler.postDelayed(this, intervaloEnvioMs)
         }
     }
 
     companion object {
+        private const val TAG = "MONITOR_SVC"
         const val CHANNEL_ID = "monitoramento_channel"
         const val NOTIFICATION_ID = 1
 
-        // Flag estática para a Activity saber se o serviço está rodando
         var isRunning = false
             private set
     }
@@ -75,67 +77,63 @@ class MonitoramentoService : Service(), SensorEventListener {
         isRunning = true
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         acelerometro = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        Log.d(TAG, "onCreate: isRunning=$isRunning acelerometro=${if (acelerometro != null) "OK" else "NULL"}")
         criarCanalNotificacao()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Inicia como Foreground Service com notificação persistente
+        Log.d(TAG, "onStartCommand: startId=$startId flags=$flags")
         startForeground(NOTIFICATION_ID, criarNotificacao())
 
-        // Limpa registros anteriores antes de re-registrar — evita duplicação em
-        // reinicializações START_STICKY, onde onStartCommand é chamado novamente
-        // sem passar por onDestroy (sensor e handler ficariam registrados duas vezes)
         sensorManager.unregisterListener(this)
         handler.removeCallbacks(tarefaEnvio)
 
-        // Registra o sensor
         acelerometro?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-        }
+            val registrado = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            Log.d(TAG, "onStartCommand: sensor registrado=$registrado")
+        } ?: Log.e(TAG, "onStartCommand: acelerômetro é NULL — sensor não disponível")
 
-        // Inicia o ciclo de envio a cada 5 segundos
         handler.postDelayed(tarefaEnvio, intervaloEnvioMs)
-
-        // START_STICKY: se o sistema matar o serviço, ele será reiniciado automaticamente
+        Log.d(TAG, "onStartCommand: handler agendado")
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent): IBinder = binder
+    override fun onBind(intent: Intent): IBinder {
+        Log.d(TAG, "onBind: Activity vinculou ao serviço")
+        return binder
+    }
 
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
         sensorManager.unregisterListener(this)
         handler.removeCallbacks(tarefaEnvio)
+        Log.d(TAG, "onDestroy: serviço encerrado — isRunning=$isRunning")
     }
-
-    // --- SensorEventListener ---
 
     override fun onSensorChanged(event: SensorEvent) {
         val x = event.values[0]
         val y = event.values[1]
         val z = event.values[2]
         val magnitude = sqrt((x * x + y * y + z * z).toDouble())
-
-        // Remove a gravidade para isolar o movimento real do usuário
         val movimento = abs(magnitude - SensorManager.GRAVITY_EARTH)
-
         somaMovimento += movimento
         totalLeituras++
-
-        // Notifica a Activity com a leitura em tempo real (se estiver vinculada)
         onNivelAtualizado?.invoke(movimento)
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    // --- Firestore ---
-
     private fun enviarDadosFirestore(nivelAtividade: Double) {
-        val usuario = auth.currentUser ?: return
+        val usuario = auth.currentUser
+        if (usuario == null) {
+            Log.e(TAG, "enviarDadosFirestore: currentUser é NULL — não autenticado!")
+            return
+        }
+        Log.d(TAG, "enviarDadosFirestore: user=${usuario.uid} nivel=$nivelAtividade")
+
         val grupo = classificarGrupo(nivelAtividade)
 
-        // 1. Registro histórico — um documento por leitura (histórico completo)
         val dadosHistorico = hashMapOf(
             "userId" to usuario.uid,
             "nomeUsuario" to (usuario.displayName ?: "Usuário"),
@@ -145,9 +143,9 @@ class MonitoramentoService : Service(), SensorEventListener {
         )
         db.collection("atividades")
             .add(dadosHistorico)
-            .addOnFailureListener { /* falha silenciosa no service */ }
+            .addOnSuccessListener { Log.d(TAG, "atividades.add: sucesso") }
+            .addOnFailureListener { e -> Log.e(TAG, "atividades.add: FALHOU — ${e.message}", e) }
 
-        // 2. Resumo do usuário com soma acumulada — usado pelo Ranking para calcular a média
         val atualizacaoResumo = hashMapOf<String, Any>(
             "userId" to usuario.uid,
             "nomeUsuario" to (usuario.displayName ?: "Usuário"),
@@ -158,10 +156,10 @@ class MonitoramentoService : Service(), SensorEventListener {
             .document(usuario.uid)
             .set(atualizacaoResumo, SetOptions.merge())
             .addOnSuccessListener {
-                // Notifica a Activity que um envio foi concluído
+                Log.d(TAG, "usuarios.set: sucesso")
                 onDadosEnviados?.invoke(nivelAtividade, grupo)
             }
-            .addOnFailureListener { /* falha silenciosa no service */ }
+            .addOnFailureListener { e -> Log.e(TAG, "usuarios.set: FALHOU — ${e.message}", e) }
     }
 
     private fun classificarGrupo(nivel: Double): String {
@@ -171,8 +169,6 @@ class MonitoramentoService : Service(), SensorEventListener {
             else -> "Muito Ativo"
         }
     }
-
-    // --- Notificação ---
 
     private fun criarCanalNotificacao() {
         val canal = NotificationChannel(
@@ -187,19 +183,17 @@ class MonitoramentoService : Service(), SensorEventListener {
     }
 
     private fun criarNotificacao(): Notification {
-        // Toque na notificação reabre a tela de monitoramento
         val intent = Intent(this, MonitoramentoActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
             this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Atividade Física")
             .setContentText("Monitorando atividade física...")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setContentIntent(pendingIntent)
-            .setOngoing(true) // Não pode ser dispensada pelo usuário
+            .setOngoing(true)
             .build()
     }
 }
