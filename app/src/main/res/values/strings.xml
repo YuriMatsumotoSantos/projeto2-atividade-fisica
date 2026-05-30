@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Projeto2-2026-1</string>
+    <!--
+        ATENÇÃO: Substitua pelo Web Client ID do seu projeto Firebase.
+        Acesse: Firebase Console → Seu Projeto → Authentication → Sign-in method → Google
+        → Web SDK configuration → Web client ID
+    -->
+    <string name="web_client_id">667036865465-ka1gl6mq3e3bedb3i79pu8pf3e8odk5j.apps.googleusercontent.com</string>
+</resources>
